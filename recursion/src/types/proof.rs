@@ -155,6 +155,20 @@ pub struct CommonDataTargets<SC: StarkGenericConfig, Comm> {
     pub lookups: Vec<Vec<Lookup<Val<SC>>>>,
 }
 
+impl<SC: StarkGenericConfig, Comm> CommonDataTargets<SC, Comm> {
+    /// Return the targets for the global preprocessed-data commitment, when
+    /// this verifier uses preprocessed columns.
+    ///
+    /// Recursive applications can use this narrow accessor to constrain the
+    /// verification key to an expected commitment without exposing or
+    /// mutating the internal per-instance preprocessed metadata.
+    pub fn preprocessed_commitment(&self) -> Option<&Comm> {
+        self.preprocessed
+            .as_ref()
+            .map(|preprocessed| &preprocessed.commitment)
+    }
+}
+
 impl<SC: StarkGenericConfig, Comm> Recursive<SC::Challenge> for CommonDataTargets<SC, Comm>
 where
     Comm: Recursive<
