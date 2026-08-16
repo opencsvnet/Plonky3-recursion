@@ -12,7 +12,7 @@ use p3_circuit_prover::batch_stark_prover::{
 use p3_circuit_prover::common::get_airs_and_degrees_with_prep;
 use p3_circuit_prover::config::{self, BabyBearConfig};
 use p3_circuit_prover::shape::{
-    iterate_profile_closure, pad_traces_to_profile, BatchStarkShape, FriQueryShape,
+    BatchStarkShape, FriQueryShape, iterate_profile_closure, pad_traces_to_profile,
 };
 use p3_field::PrimeCharacteristicRing;
 
@@ -271,5 +271,128 @@ fn iterate_profile_closure_stops_on_structural_mismatch() {
             ProofMetadataError::ProfileStructuralMismatch(_),
         ) => {}
         other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+/// Grow only the verifier dimensions `union` mutates outside rows/NPO rows.
+fn grow_instance_preprocessed_fri(shape: &mut BatchStarkShape<BabyBear>, delta: usize) {
+    if let Some(prep) = shape.preprocessed.as_mut() {
+        for inst in prep.instances.iter_mut().flatten() {
+            inst.degree_bits += delta;
+        }
+    }
+    for inst in &mut shape.instances {
+        inst.degree_bits += delta;
+        if inst.quotient_chunks.is_empty() {
+            inst.quotient_chunks.push(delta);
+        } else {
+            inst.quotient_chunks[0] += delta;
+        }
+    }
+    if let Some(fri) = shape.fri.as_mut() {
+        fri.commit_phase_len += delta;
+        fri.final_poly_len += delta;
+    }
+}
+
+#[test]
+fn covers_rejects_instance_preprocessed_fri_growth() {
+    let proof = baby_bear_base_proof();
+    let seed = BatchStarkShape::<BabyBear>::from_proof_with_fri(&proof);
+    assert!(seed.preprocessed.is_some());
+    assert!(seed.fri.is_some());
+    assert!(!seed.instances.is_empty());
+
+    let mut grown = seed.clone();
+    grow_instance_preprocessed_fri(&mut grown, 1);
+    // The hole at 7800909e: covers() ignored these fields and returned Ok.
+    assert!(matches!(
+        seed.covers(&grown),
+        Err(ProofMetadataError::ProfileOverflow { .. })
+    ));
+    assert_eq!(seed.covers(&seed), Ok(()));
+}
+
+#[test]
+fn iterate_profile_closure_bumps_instance_preprocessed_fri_dims() {
+    let proof = baby_bear_base_proof();
+    let seed = BatchStarkShape::<BabyBear>::from_proof_with_fri(&proof);
+    let mut target = seed.clone();
+    grow_instance_preprocessed_fri(&mut target, 2);
+
+    let mut calls = 0usize;
+    let closed = iterate_profile_closure(
+        seed.clone(),
+        |_| {
+            calls += 1;
+            Ok::<_, core::convert::Infallible>(target.clone())
+        },
+        8,
+    )
+    .unwrap();
+
+    assert!(
+        calls > 1,
+        "closure must iterate a union bump, not accept the seed"
+    );
+    assert_eq!(
+        closed.instances[0].degree_bits,
+        target.instances[0].degree_bits
+    );
+    assert_eq!(
+        closed.instances[0].quotient_chunks,
+        target.instances[0].quotient_chunks
+    );
+    assert_eq!(
+        closed.preprocessed.as_ref().and_then(|p| {
+            p.instances
+                .iter()
+                .find_map(|inst| inst.as_ref().map(|m| m.degree_bits))
+        }),
+        target.preprocessed.as_ref().and_then(|p| {
+            p.instances
+                .iter()
+                .find_map(|inst| inst.as_ref().map(|m| m.degree_bits))
+        })
+    );
+    assert_eq!(
+        closed
+            .fri
+            .as_ref()
+            .map(|f| (f.commit_phase_len, f.final_poly_len)),
+        target
+            .fri
+            .as_ref()
+            .map(|f| (f.commit_phase_len, f.final_poly_len))
+    );
+    assert_ne!(closed, seed, "must not return the stale profile");
+}
+
+#[test]
+fn covers_rejects_fri_presence_growth() {
+    let proof = baby_bear_base_proof();
+    let without = BatchStarkShape::<BabyBear>::from_proof(&proof);
+    let with = BatchStarkShape::<BabyBear>::from_proof_with_fri(&proof);
+    assert!(without.fri.is_none());
+    assert!(with.fri.is_some());
+
+    assert!(matches!(
+        without.covers(&with),
+        Err(ProofMetadataError::ProfileStructuralMismatch(_))
+    ));
+    // A FRI-locked profile may still cover a FRI-less actual (pad-to-profile).
+    assert_eq!(with.covers(&without), Ok(()));
+
+    let err = iterate_profile_closure(
+        without.clone(),
+        |_| Ok::<_, core::convert::Infallible>(with.clone()),
+        4,
+    )
+    .unwrap_err();
+    match err {
+        p3_circuit_prover::shape::ProfileClosureError::Shape(
+            ProofMetadataError::ProfileStructuralMismatch(_),
+        ) => {}
+        other => panic!("FRI-less profile must reject, not close: {other:?}"),
     }
 }

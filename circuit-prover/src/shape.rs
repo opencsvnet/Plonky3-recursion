@@ -474,7 +474,11 @@ impl<F: Copy + PartialEq> BatchStarkShape<F> {
     }
 
     /// Return `Ok(())` when `other` fits inside this profile: same structural
-    /// flags and `self` counts are componentwise `>=` `other` counts.
+    /// flags and every dimension [`Self::union`] can grow is componentwise
+    /// `>=` in `self`. Presence growth in the coverage direction (this
+    /// profile missing a preprocessed instance, FRI layout, or commitment
+    /// that `other` carries) is a structural reject — those fields are not
+    /// added by `union`, so accepting them would false-close iteration.
     pub fn covers(&self, other: &Self) -> Result<(), ProofMetadataError> {
         self.assert_same_structure(other)?;
         check_count_fits(
@@ -505,6 +509,63 @@ impl<F: Copy + PartialEq> BatchStarkShape<F> {
                     limit: profile.rows,
                 });
             }
+        }
+        cover_preprocessed(self.preprocessed.as_ref(), other.preprocessed.as_ref())?;
+        for (i, (profile, actual)) in self.instances.iter().zip(&other.instances).enumerate() {
+            check_count_fits(
+                &format!("instances[{i}].degree_bits"),
+                actual.degree_bits,
+                profile.degree_bits,
+            )?;
+            if actual.quotient_chunks.len() > profile.quotient_chunks.len() {
+                return Err(ProofMetadataError::ProfileOverflow {
+                    table: format!("instances[{i}].quotient_chunks.len"),
+                    actual: actual.quotient_chunks.len(),
+                    limit: profile.quotient_chunks.len(),
+                });
+            }
+            for (j, (limit, got)) in profile
+                .quotient_chunks
+                .iter()
+                .zip(&actual.quotient_chunks)
+                .enumerate()
+            {
+                check_count_fits(
+                    &format!("instances[{i}].quotient_chunks[{j}]"),
+                    *got,
+                    *limit,
+                )?;
+            }
+        }
+        match (&self.fri, &other.fri) {
+            (None, Some(_)) => {
+                return Err(ProofMetadataError::ProfileStructuralMismatch(
+                    "fri: profile has none but the other shape carries a layout".into(),
+                ));
+            }
+            (Some(profile), Some(actual)) => {
+                check_count_fits(
+                    "fri.commit_phase_len",
+                    actual.commit_phase_len,
+                    profile.commit_phase_len,
+                )?;
+                check_count_fits(
+                    "fri.final_poly_len",
+                    actual.final_poly_len,
+                    profile.final_poly_len,
+                )?;
+            }
+            (None, None) | (Some(_), None) => {}
+        }
+        if other.has_permutation_commitment && !self.has_permutation_commitment {
+            return Err(ProofMetadataError::ProfileStructuralMismatch(
+                "permutation commitment: profile has none but the other shape carries one".into(),
+            ));
+        }
+        if other.has_random_commitment && !self.has_random_commitment {
+            return Err(ProofMetadataError::ProfileStructuralMismatch(
+                "random commitment: profile has none but the other shape carries one".into(),
+            ));
         }
         Ok(())
     }
@@ -605,6 +666,62 @@ impl<F: Copy + PartialEq> BatchStarkShape<F> {
                 )));
             }
         }
+        if self.instances.len() != other.instances.len() {
+            return Err(ProofMetadataError::ProfileStructuralMismatch(format!(
+                "instance count {} vs {}",
+                self.instances.len(),
+                other.instances.len()
+            )));
+        }
+        for (i, (a, b)) in self.instances.iter().zip(&other.instances).enumerate() {
+            if a.trace_local != b.trace_local
+                || a.trace_next != b.trace_next
+                || a.preprocessed_local != b.preprocessed_local
+                || a.preprocessed_next != b.preprocessed_next
+                || a.random != b.random
+                || a.perm_local != b.perm_local
+                || a.perm_next != b.perm_next
+                || a.has_lookup_terminal != b.has_lookup_terminal
+            {
+                return Err(ProofMetadataError::ProfileStructuralMismatch(format!(
+                    "instances[{i}] opened layout"
+                )));
+            }
+        }
+        if let (Some(a), Some(b)) = (&self.preprocessed, &other.preprocessed) {
+            if a.matrix_to_instance != b.matrix_to_instance {
+                return Err(ProofMetadataError::ProfileStructuralMismatch(
+                    "preprocessed matrix_to_instance".into(),
+                ));
+            }
+            if a.instances.len() != b.instances.len() {
+                return Err(ProofMetadataError::ProfileStructuralMismatch(format!(
+                    "preprocessed instance count {} vs {}",
+                    a.instances.len(),
+                    b.instances.len()
+                )));
+            }
+            for (i, (lhs, rhs)) in a.instances.iter().zip(&b.instances).enumerate() {
+                if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+                    if lhs.matrix_index != rhs.matrix_index || lhs.width != rhs.width {
+                        return Err(ProofMetadataError::ProfileStructuralMismatch(format!(
+                            "preprocessed[{i}] identity"
+                        )));
+                    }
+                }
+            }
+        }
+        if let (Some(a), Some(b)) = (&self.fri, &other.fri) {
+            if a.commit_pow_count != b.commit_pow_count
+                || a.query_count != b.query_count
+                || a.log_arities != b.log_arities
+                || a.sibling_counts != b.sibling_counts
+            {
+                return Err(ProofMetadataError::ProfileStructuralMismatch(
+                    "fri query identity".into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -618,6 +735,47 @@ fn check_count_fits(table: &str, actual: usize, limit: usize) -> Result<(), Proo
         });
     }
     Ok(())
+}
+
+/// Cover preprocessed instance degrees. Presence growth in the coverage
+/// direction is structural: `union` will not introduce a missing instance.
+fn cover_preprocessed(
+    profile: Option<&PreprocessedShape>,
+    other: Option<&PreprocessedShape>,
+) -> Result<(), ProofMetadataError> {
+    match (profile, other) {
+        (None, Some(_)) => Err(ProofMetadataError::ProfileStructuralMismatch(
+            "preprocessed: profile has none but the other shape carries metadata".into(),
+        )),
+        (Some(profile), Some(other)) => {
+            if profile.instances.len() != other.instances.len() {
+                return Err(ProofMetadataError::ProfileStructuralMismatch(format!(
+                    "preprocessed instance count {} vs {}",
+                    profile.instances.len(),
+                    other.instances.len()
+                )));
+            }
+            for (i, (p, a)) in profile.instances.iter().zip(&other.instances).enumerate() {
+                match (p, a) {
+                    (None, Some(_)) => {
+                        return Err(ProofMetadataError::ProfileStructuralMismatch(format!(
+                            "preprocessed[{i}]: profile has none but the other shape carries an instance"
+                        )));
+                    }
+                    (Some(p), Some(a)) => {
+                        check_count_fits(
+                            &format!("preprocessed[{i}].degree_bits"),
+                            a.degree_bits,
+                            p.degree_bits,
+                        )?;
+                    }
+                    (None, None) | (Some(_), None) => {}
+                }
+            }
+            Ok(())
+        }
+        (None, None) | (Some(_), None) => Ok(()),
+    }
 }
 
 /// Pad primitive traces so raw row counts equal `profile`.
@@ -713,8 +871,12 @@ impl<E: core::fmt::Debug + core::fmt::Display> core::error::Error for ProfileClo
 ///
 /// `measure_wrapper(profile)` must return `shape(wrapper(profile))` for every
 /// semantic class the caller cares about (or the componentwise-max of those
-/// classes). Closure is `profile.covers(wrapper)`. Counts are bumped via
-/// [`BatchStarkShape::union`]; a structural mismatch kills the construction.
+/// classes). Closure is `profile.covers(wrapper)`. Every dimension `union`
+/// can grow — primitive/NPO rows, preprocessed instance degrees, opened
+/// `degree_bits` / `quotient_chunks`, FRI phase/final lengths — is covered
+/// componentwise; presence growth in the coverage direction is structural.
+/// Counts are bumped via [`BatchStarkShape::union`]; a structural mismatch
+/// kills the construction.
 ///
 /// This bootstrap depends only on shapes, never on proof or verification-key
 /// values.
