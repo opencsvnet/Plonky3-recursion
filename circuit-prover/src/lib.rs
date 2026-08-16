@@ -52,5 +52,5 @@ pub use constraint_profile::ConstraintProfile;
 pub use shape::{
     BatchStarkShape, FriQueryShape, FriQueryShapeSource, InstanceOpenedShape, NpoShapeEntry,
     PreprocessedInstanceShape, PreprocessedShape, ProfileClosureError, iterate_profile_closure,
-    pad_traces_to_profile,
+    pad_preprocessed_to_profile, pad_proof_inputs_to_profile, pad_traces_to_profile,
 };

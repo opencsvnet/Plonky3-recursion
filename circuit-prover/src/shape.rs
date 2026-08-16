@@ -10,14 +10,16 @@
 //! Exact equality against a real proof is the packing / native-verify gate:
 //! a proof that does not match the descriptor is rejected before values are
 //! packed or verified. [`pad_to_profile`] never silently selects a larger
-//! profile; overflow is a hard error.
+//! profile; overflow is a hard error. [`pad_proof_inputs_to_profile`] lifts
+//! a concrete proof's traces and committed preprocessed multiplicities onto
+//! that frozen profile with AIR-valid dummy rows.
 
 use alloc::format;
 use alloc::vec::Vec;
 
 use p3_batch_stark::{StarkGenericConfig, Val};
-use p3_circuit::ops::NpoTypeId;
-use p3_circuit::tables::Traces;
+use p3_circuit::ops::{NonPrimitivePreprocessedMap, NpoTypeId};
+use p3_circuit::tables::{NpoPadError, Traces};
 use p3_circuit::types::WitnessId;
 use p3_commit::{Mmcs, Pcs};
 use p3_field::{Field, PrimeCharacteristicRing};
@@ -25,7 +27,8 @@ use p3_fri::FriProof;
 use serde::{Deserialize, Serialize};
 
 use crate::batch_stark_prover::{
-    AirVariant, BatchStarkProof, PrimitiveTable, ProofMetadataError, RowCounts, TablePacking,
+    AirVariant, BatchStarkProof, CircuitProverData, PrimitiveTable, ProofMetadataError, RowCounts,
+    TablePacking,
 };
 
 /// Value-free description of one non-primitive table.
@@ -785,11 +788,17 @@ fn cover_preprocessed(
     }
 }
 
-/// Pad primitive traces so raw row counts equal `profile`.
+/// Pad every registered trace so raw row counts equal `profile`.
 ///
-/// Extra const / public / ALU rows are dummy unused zeros. Overflow of any
-/// primitive table is a hard error. Non-primitive traces are not rewritten
-/// (plugin-specific); their counts are still checked against the profile.
+/// Extra const / public / ALU rows are dummy unused zeros. Extra NPO rows
+/// are each table's AIR-valid no-op (Poseidon1/2: sponge `new_start` of the
+/// zero state with every CTL flag off; recompose: zero values). Overflow of
+/// any table is a hard error. A table that cannot produce a valid dummy row
+/// is [`ProofMetadataError::NoValidDummyRow`] — a finding, not a forced pad.
+///
+/// This only rewrites traces. Call [`pad_preprocessed_to_profile`] (or
+/// [`pad_proof_inputs_to_profile`]) so committed multiplicities stay in lockstep;
+/// otherwise a padded proof will not verify.
 pub fn pad_traces_to_profile<F, S>(
     traces: &mut Traces<F>,
     profile: &BatchStarkShape<S>,
@@ -814,12 +823,258 @@ where
             .non_primitive_traces
             .get(&entry.op_type)
             .map_or(0, |t| t.rows());
-        if have > entry.rows {
-            return Err(ProofMetadataError::ProfileOverflow {
+        check_count_fits(&format!("npo {:?}", entry.op_type), have, entry.rows)?;
+        if have == entry.rows {
+            continue;
+        }
+        let Some(trace) = traces.non_primitive_traces.get_mut(&entry.op_type) else {
+            return Err(ProofMetadataError::NoValidDummyRow {
                 table: format!("npo {:?}", entry.op_type),
                 actual: have,
                 limit: entry.rows,
             });
+        };
+        trace.pad_dummy_rows(entry.rows).map_err(|err| match err {
+            NpoPadError::NoValidDummyRow => ProofMetadataError::NoValidDummyRow {
+                table: format!("npo {:?}", entry.op_type),
+                actual: have,
+                limit: entry.rows,
+            },
+        })?;
+    }
+    Ok(())
+}
+
+/// Pad committed preprocessed columns (including multiplicities) to `profile`.
+///
+/// Dummy prep rows are zeros, so every multiplicity is 0 and the row does not
+/// contribute to a lookup. Poseidon1/2 also mark the first dummy row as a
+/// chain boundary (second-to-last preprocessed column = 1), matching the AIR's
+/// existing power-of-two pad.
+///
+/// When a table's flattened prep is empty (the circuit never registered the
+/// op), width comes from the table spec — not from `cols.len() / have`, which
+/// is 0 and used to hard-reject. A table with no well-defined dummy prep
+/// width is [`ProofMetadataError::NoValidDummyRow`] (a finding, not a forced
+/// pad). Call this on the **unpadded** traces so a non-empty prep can still
+/// infer width from `prep_len / have_rows`.
+pub fn pad_preprocessed_to_profile<F, PF, S>(
+    traces: &Traces<F>,
+    primitive_columns: &mut [Vec<PF>],
+    non_primitive_columns: &mut NonPrimitivePreprocessedMap<PF>,
+    profile: &BatchStarkShape<S>,
+) -> Result<(), ProofMetadataError>
+where
+    PF: PrimeCharacteristicRing,
+    S: Copy + PartialEq,
+{
+    let primitive_have = [
+        traces.const_trace.values.len().max(1),
+        traces.public_trace.values.len().max(1),
+        traces.alu_trace.values.len().max(1),
+    ];
+    let primitive_targets = [
+        profile.rows[PrimitiveTable::Const],
+        profile.rows[PrimitiveTable::Public],
+        profile.rows[PrimitiveTable::Alu],
+    ];
+    for (i, (have, target)) in primitive_have.iter().zip(primitive_targets).enumerate() {
+        if *have == target {
+            continue;
+        }
+        check_count_fits(&format!("preprocessed primitive[{i}]"), *have, target)?;
+        let Some(cols) = primitive_columns.get_mut(i) else {
+            return Err(ProofMetadataError::NoValidDummyRow {
+                table: format!("preprocessed primitive[{i}]"),
+                actual: *have,
+                limit: target,
+            });
+        };
+        pad_flat_preprocessed(
+            cols,
+            *have,
+            target,
+            None,
+            &format!("preprocessed primitive[{i}]"),
+            primitive_dummy_prep_width(i, profile.ext_degree),
+        )?;
+    }
+
+    for entry in &profile.non_primitives {
+        let have = traces
+            .non_primitive_traces
+            .get(&entry.op_type)
+            .map_or(0, |t| t.rows());
+        check_count_fits(
+            &format!("preprocessed npo {:?}", entry.op_type),
+            have,
+            entry.rows,
+        )?;
+        if have == entry.rows {
+            continue;
+        }
+        let Some(cols) = non_primitive_columns.get_mut(&entry.op_type) else {
+            return Err(ProofMetadataError::NoValidDummyRow {
+                table: format!("preprocessed npo {:?}", entry.op_type),
+                actual: have,
+                limit: entry.rows,
+            });
+        };
+        let chain_boundary = poseidon_perm_needs_chain_boundary(&entry.op_type);
+        pad_flat_preprocessed(
+            cols,
+            have,
+            entry.rows,
+            chain_boundary.then_some(mark_poseidon_first_dummy_chain_boundary),
+            &format!("preprocessed npo {:?}", entry.op_type),
+            npo_dummy_prep_width(&entry.op_type, profile.ext_degree),
+        )?;
+    }
+    Ok(())
+}
+
+/// Pad traces and committed preprocessed columns together.
+///
+/// Preprocessed is padded first so dummy-row widths are inferred from the
+/// unpadded counts. Prefer [`CircuitProverData::pad_to_profile`], which also
+/// marks setup commitments stale so prove rebuilds `ProverData` even when
+/// the padded counts stay inside the same power-of-two height.
+pub fn pad_proof_inputs_to_profile<F, PF, S>(
+    traces: &mut Traces<F>,
+    primitive_columns: &mut [Vec<PF>],
+    non_primitive_columns: &mut NonPrimitivePreprocessedMap<PF>,
+    profile: &BatchStarkShape<S>,
+) -> Result<(), ProofMetadataError>
+where
+    F: Field + PrimeCharacteristicRing,
+    PF: PrimeCharacteristicRing,
+    S: Copy + PartialEq,
+{
+    pad_preprocessed_to_profile(traces, primitive_columns, non_primitive_columns, profile)?;
+    pad_traces_to_profile(traces, profile)
+}
+
+impl<SC: StarkGenericConfig> CircuitProverData<SC> {
+    /// Pad traces and this circuit's committed preprocessed columns to `profile`.
+    ///
+    /// Marks [`Self::preprocessed_stale`] so the next prove rebuilds
+    /// `ProverData` even when dummy rows fit in the existing power-of-two
+    /// domain. Also drops the ALU schedule cache (op count changed).
+    pub fn pad_to_profile<F, S>(
+        &mut self,
+        traces: &mut Traces<F>,
+        profile: &BatchStarkShape<S>,
+    ) -> Result<(), ProofMetadataError>
+    where
+        F: Field + PrimeCharacteristicRing,
+        S: Copy + PartialEq,
+    {
+        pad_proof_inputs_to_profile(
+            traces,
+            &mut self.primitive_columns,
+            &mut self.non_primitive_columns,
+            profile,
+        )?;
+        self.preprocessed_stale = true;
+        *self.alu_schedule_cache.borrow_mut() = None;
+        Ok(())
+    }
+}
+
+fn poseidon_perm_needs_chain_boundary(op_type: &NpoTypeId) -> bool {
+    let id = op_type.as_str();
+    id.starts_with("poseidon2_perm/") || id.starts_with("poseidon1_perm/")
+}
+
+fn mark_poseidon_first_dummy_chain_boundary<PF: PrimeCharacteristicRing>(row: &mut [PF]) {
+    // AIR `preprocessed_trace`: first pad row has chain-start at width-2.
+    if row.len() >= 2 {
+        row[row.len() - 2] = PF::ONE;
+    }
+}
+
+/// Public dummy prep: `[multiplicity, witness_idx]` per logical op.
+/// Locked by `air::shape_golden::public_air_shape_is_stable` (lanes=1 → 2).
+const PUBLIC_DUMMY_PREP_WIDTH: usize = 2;
+
+/// ALU dummy prep: `AluPrepLaneCols` (13). Same all-zero row
+/// `get_airs_and_degrees_with_prep` emits for an empty ALU table. Horner
+/// extras are AIR-matrix only — the flattened per-op vec is 13 wide.
+const ALU_DUMMY_PREP_WIDTH: usize = 13;
+
+/// Known dummy-prep width for a primitive table, independent of
+/// `cols.len() / have`. Empty flattened prep (circuit never registered the
+/// op) still has an AIR-valid all-zero dummy (multiplicity 0).
+fn primitive_dummy_prep_width(table: usize, ext_degree: usize) -> Option<usize> {
+    match table {
+        i if i == PrimitiveTable::Const as usize => {
+            // [ext_mult, index, value[0..D]]. D=0 is not a real circuit.
+            (ext_degree > 0).then_some(PUBLIC_DUMMY_PREP_WIDTH + ext_degree)
+        }
+        i if i == PrimitiveTable::Public as usize => Some(PUBLIC_DUMMY_PREP_WIDTH),
+        i if i == PrimitiveTable::Alu as usize => Some(ALU_DUMMY_PREP_WIDTH),
+        _ => None,
+    }
+}
+
+/// Known dummy-prep width for a registered NPO. Poseidon width is
+/// config-specific and is inferred from a non-empty flattened vec when the
+/// circuit registered the op; an empty poseidon/unknown prep is a finding.
+fn npo_dummy_prep_width(op_type: &NpoTypeId, ext_degree: usize) -> Option<usize> {
+    match op_type.as_str() {
+        "recompose" => Some(2),
+        "recompose/coeff" if ext_degree > 0 => Some(2 + 2 * ext_degree),
+        _ => None,
+    }
+}
+
+fn pad_flat_preprocessed<PF: PrimeCharacteristicRing>(
+    cols: &mut Vec<PF>,
+    have: usize,
+    target: usize,
+    first_dummy: Option<fn(&mut [PF])>,
+    table: &str,
+    known_width: Option<usize>,
+) -> Result<(), ProofMetadataError> {
+    if have == target {
+        return Ok(());
+    }
+    let width = if have > 0 && !cols.is_empty() {
+        if !cols.len().is_multiple_of(have) {
+            return Err(ProofMetadataError::NoValidDummyRow {
+                table: table.into(),
+                actual: have,
+                limit: target,
+            });
+        }
+        let inferred = cols.len() / have;
+        if inferred == 0 {
+            known_width
+                .filter(|w| *w > 0)
+                .ok_or_else(|| ProofMetadataError::NoValidDummyRow {
+                    table: table.into(),
+                    actual: have,
+                    limit: target,
+                })?
+        } else {
+            inferred
+        }
+    } else {
+        // Empty flattened prep (or have == 0): do not infer `0 / 1 = 0`.
+        known_width
+            .filter(|w| *w > 0)
+            .ok_or_else(|| ProofMetadataError::NoValidDummyRow {
+                table: table.into(),
+                actual: have,
+                limit: target,
+            })?
+    };
+    cols.resize(width * target, PF::ZERO);
+    if let Some(mark) = first_dummy {
+        let dummy_row = have.min(target.saturating_sub(1));
+        let start = dummy_row * width;
+        if start + width <= cols.len() {
+            mark(&mut cols[start..start + width]);
         }
     }
     Ok(())

@@ -14,13 +14,13 @@ use alloc::{format, vec};
 use core::any::Any;
 use core::fmt::Debug;
 
-use p3_field::{ExtensionField, Field, PrimeField64};
+use p3_field::{ExtensionField, Field, PrimeCharacteristicRing, PrimeField64};
 use p3_maybe_rayon::prelude::*;
 
 use crate::CircuitError;
 use crate::builder::{CircuitBuilderError, NpoCircuitPlugin, NpoLoweringContext};
 use crate::ops::{ExecutionContext, NonPrimitiveExecutor, NpoTypeId, Op, PreprocessedWriter};
-use crate::tables::{NonPrimitiveTrace, TraceGeneratorFn};
+use crate::tables::{NonPrimitiveTrace, NpoPadError, TraceGeneratorFn};
 use crate::types::{ExprId, WitnessId};
 
 // ============================================================================
@@ -349,7 +349,10 @@ impl<F> RecomposeTrace<F> {
     }
 }
 
-impl<TraceF: Clone + Send + Sync + 'static, CF> NonPrimitiveTrace<CF> for RecomposeTrace<TraceF> {
+impl<TraceF, CF> NonPrimitiveTrace<CF> for RecomposeTrace<TraceF>
+where
+    TraceF: Clone + Send + Sync + PrimeCharacteristicRing + 'static,
+{
     fn op_type(&self) -> NpoTypeId {
         match self.kind {
             RecomposeTraceKind::Standard => NpoTypeId::recompose(),
@@ -367,6 +370,26 @@ impl<TraceF: Clone + Send + Sync + 'static, CF> NonPrimitiveTrace<CF> for Recomp
 
     fn boxed_clone(&self) -> Box<dyn NonPrimitiveTrace<CF>> {
         Box::new(self.clone())
+    }
+
+    fn pad_dummy_rows(&mut self, target: usize) -> Result<(), NpoPadError> {
+        if self.operations.len() >= target {
+            return Ok(());
+        }
+        let Some(template) = self.operations.first() else {
+            return Err(NpoPadError::NoValidDummyRow);
+        };
+        // Zero local AIR constraints; soundness is the WitnessChecks CTL.
+        // Dummy rows carry dummy witness ids and zero values. The matching
+        // preprocessed pad sets `out_mult` / `coeff_mult` to 0 so they do
+        // not contribute to the bus.
+        let filler = RecomposeCircuitRow {
+            input_wids: vec![WitnessId(0); template.input_wids.len()],
+            output_wid: WitnessId(0),
+            values: vec![TraceF::ZERO; template.values.len()],
+        };
+        self.operations.resize(target, filler);
+        Ok(())
     }
 }
 
