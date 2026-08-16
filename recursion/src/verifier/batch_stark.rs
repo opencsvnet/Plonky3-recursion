@@ -34,6 +34,8 @@ use crate::traits::{
 use crate::types::{
     BatchProofTargets, CommonDataTargets, OpenedValuesTargets, OpenedValuesTargetsWithLookups,
 };
+use p3_circuit_prover::shape::BatchStarkShape;
+
 use crate::{BatchStarkVerifierInputsBuilder, Target};
 
 /// Type alias for PCS verifier parameters.
@@ -238,7 +240,74 @@ where
             Comm,
             <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Domain,
         >,
-    Val<SC>: PrimeField64,
+    Val<SC>: PrimeField64 + Copy + PartialEq,
+    SC::Challenge: ExtensionField<Val<SC>> + PrimeCharacteristicRing + ExtractBinomialW<Val<SC>>,
+    <<SC as StarkGenericConfig>::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Domain: Clone,
+    SymbolicExpressionExt<Val<SC>, SC::Challenge>:
+        Algebra<SymbolicExpression<Val<SC>>> + Algebra<SC::Challenge>,
+{
+    let shape = BatchStarkShape::<Val<SC>>::from_proof(proof);
+    verify_p3_batch_shape_circuit::<SC, Comm, InputProof, OpeningProof, LG, CP, WIDTH, RATE, TRACE_D>(
+        config,
+        circuit,
+        &shape,
+        proof,
+        pcs_params,
+        common_data,
+        lookup_gadget,
+        challenger_perm_config,
+        non_primitive_provers,
+    )
+}
+
+/// Build a recursive batch-STARK verifier from a value-free [`BatchStarkShape`].
+///
+/// AIRs and public-count layout come from `shape`, not from attacker-selected
+/// proof metadata. `proof` is required only as a dimensional template for
+/// target allocation and must match `shape` exactly — a mismatch is rejected
+/// before any target is allocated or any value is packed.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+pub fn verify_p3_batch_shape_circuit<
+    SC: StarkGenericConfig + 'static,
+    Comm: Recursive<
+            SC::Challenge,
+            Input = <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Commitment,
+        > + Clone
+        + ObservableCommitment,
+    InputProof: Recursive<SC::Challenge>,
+    OpeningProof: Recursive<SC::Challenge, Input = <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Proof>,
+    LG: RecursiveLookupGadget<SC::Challenge>,
+    CP: ChallengerPermConfig,
+    const WIDTH: usize,
+    const RATE: usize,
+    const TRACE_D: usize,
+>(
+    config: &SC,
+    circuit: &mut CircuitBuilder<SC::Challenge>,
+    shape: &BatchStarkShape<Val<SC>>,
+    proof: &p3_circuit_prover::batch_stark_prover::BatchStarkProof<SC>,
+    pcs_params: &PcsVerifierParams<SC, InputProof, OpeningProof, Comm>,
+    common_data: &CommonData<SC>,
+    lookup_gadget: &LG,
+    challenger_perm_config: CP,
+    non_primitive_provers: &[Box<dyn TableProver<SC>>],
+) -> Result<
+    (
+        BatchStarkVerifierInputsBuilder<SC, Comm, OpeningProof>,
+        Vec<NonPrimitiveOpId>,
+    ),
+    VerificationError,
+>
+where
+    <SC as StarkGenericConfig>::Pcs: RecursivePcs<
+            SC,
+            InputProof,
+            OpeningProof,
+            Comm,
+            <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Domain,
+        >,
+    Val<SC>: PrimeField64 + Copy + PartialEq,
     SC::Challenge: ExtensionField<Val<SC>> + PrimeCharacteristicRing + ExtractBinomialW<Val<SC>>,
     <<SC as StarkGenericConfig>::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Domain: Clone,
     SymbolicExpressionExt<Val<SC>, SC::Challenge>:
@@ -247,28 +316,34 @@ where
     proof
         .validate()
         .map_err(|e| VerificationError::InvalidProofShape(e.to_string()))?;
-    if proof.ext_degree != TRACE_D {
+    // Circuit construction is generic over the PCS opening-proof type, so FRI
+    // layout cannot be extracted here. A locked `shape.fri` is compared at
+    // packing (`pack_values_matching_shape`) and native verify
+    // (`verify_all_tables_matching_shape`). Metadata is matched after dropping
+    // the optional FRI field.
+    let mut meta = shape.clone();
+    let _ = meta.fri.take();
+    meta.matches_proof(proof)
+        .map_err(|e| VerificationError::InvalidProofShape(e.to_string()))?;
+    if shape.ext_degree != TRACE_D {
         return Err(VerificationError::InvalidProofShape(format!(
-            "trace extension degree mismatch: proof declares {} but verifier expects {TRACE_D}",
-            proof.ext_degree
+            "trace extension degree mismatch: shape declares {} but verifier expects {TRACE_D}",
+            shape.ext_degree
         )));
     }
-    let rows: RowCounts = proof.rows;
-    let packing = proof.table_packing.clone();
+    let rows: RowCounts = shape.rows;
+    let packing = shape.table_packing.clone();
     let public_lanes = packing.public_lanes();
     let alu_lanes = packing.alu_lanes();
 
-    // Create AluAir with appropriate constructor based on TRACE_D and the stored
-    // primitive ALU variant used during proving.
-    // For now both variants share the same AIR type; this hook allows us to swap
-    // in a different ALU AIR in the future based on `proof.alu_variant`.
-    let alu_air = match proof.alu_variant {
+    // Create AluAir from the frozen shape, not from attacker-selected proof metadata.
+    let alu_air = match shape.alu_variant {
         AirVariant::Baseline | AirVariant::Optimized => {
             create_alu_air::<Val<SC>, SC::Challenge, TRACE_D>(
                 rows[PrimitiveTable::Alu],
                 alu_lanes,
                 packing.horner_packed_steps(),
-                proof.alu_quintic_trinomial,
+                shape.alu_quintic_trinomial,
             )
         }
     };
@@ -284,14 +359,14 @@ where
         CircuitTablesAir::Alu(alu_air),
     ];
 
-    if proof.non_primitives.len() != non_primitive_provers.len() {
+    if shape.non_primitives.len() != non_primitive_provers.len() {
         return Err(VerificationError::InvalidProofShape(format!(
             "non-primitive table count mismatch: expected {}, got {}",
             non_primitive_provers.len(),
-            proof.non_primitives.len()
+            shape.non_primitives.len()
         )));
     }
-    for (i, (entry, plugin)) in proof
+    for (i, (entry, plugin)) in shape
         .non_primitives
         .iter()
         .zip(non_primitive_provers.iter())
@@ -304,15 +379,18 @@ where
                 entry.op_type
             )));
         }
+        // Reconstruct the table entry from the shape (value-free public counts)
+        // plus the proof's public *values* only after the shape has matched.
+        let proof_entry = &proof.non_primitives[i];
         let air = plugin
-            .batch_air_from_table_entry(config, TRACE_D, proof.ext_degree as u32, entry)
+            .batch_air_from_table_entry(config, TRACE_D, shape.ext_degree as u32, proof_entry)
             .map_err(VerificationError::InvalidProofShape)?;
         circuit_airs.push(CircuitTablesAir::Dynamic(air));
     }
 
     let mut air_public_counts = vec![0usize; NUM_PRIMITIVE_TABLES];
-    for entry in &proof.non_primitives {
-        air_public_counts.push(entry.public_values.len());
+    for entry in &shape.non_primitives {
+        air_public_counts.push(entry.public_values_len);
     }
     let mut verifier_inputs = BatchStarkVerifierInputsBuilder::<SC, Comm, OpeningProof>::allocate(
         circuit,

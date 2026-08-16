@@ -496,6 +496,19 @@ impl RowCounts {
         }
         Ok(())
     }
+
+    /// Primitive table row counts in `Const`, `Public`, `Alu` order.
+    pub const fn as_array(&self) -> [usize; NUM_PRIMITIVE_TABLES] {
+        self.0
+    }
+
+    /// Componentwise maximum with `other`. Both sides must already be valid.
+    #[must_use]
+    pub fn component_max(self, other: Self) -> Self {
+        let a = self.0;
+        let b = other.0;
+        Self([a[0].max(b[0]), a[1].max(b[1]), a[2].max(b[2])])
+    }
 }
 
 impl core::ops::Index<PrimitiveTable> for RowCounts {
@@ -799,6 +812,61 @@ pub enum ProofMetadataError {
         expected: usize,
         got: usize,
     },
+
+    /// Primitive row counts do not match the expected shape.
+    #[error("row counts mismatch: expected {expected:?}, got {got:?}")]
+    RowCountsMismatch {
+        expected: [usize; NUM_PRIMITIVE_TABLES],
+        got: [usize; NUM_PRIMITIVE_TABLES],
+    },
+
+    /// [`TablePacking`] does not match the expected shape.
+    #[error("table packing mismatch")]
+    TablePackingMismatch,
+
+    /// A non-primitive table's raw row count does not match the expected shape.
+    #[error("non-primitive row count mismatch at index {index}: expected {expected}, got {got}")]
+    NpoRowsMismatch {
+        index: usize,
+        expected: usize,
+        got: usize,
+    },
+
+    /// A non-primitive table's lane count does not match the expected shape.
+    #[error("non-primitive lane count mismatch at index {index}: expected {expected}, got {got}")]
+    NpoLanesMismatch {
+        index: usize,
+        expected: usize,
+        got: usize,
+    },
+
+    /// Preprocessed instance metadata (widths, degree bits, matrix map) does not match.
+    #[error("preprocessed instance metadata mismatch")]
+    PreprocessedMetaMismatch,
+
+    /// Opened-value / degree / lookup-terminal layout does not match at `index`.
+    #[error("opened-value layout mismatch at instance {index}: {detail}")]
+    OpenedLayoutMismatch { index: usize, detail: String },
+
+    /// FRI query / commit-phase layout does not match the expected shape.
+    #[error("FRI query layout mismatch: {0}")]
+    FriLayoutMismatch(String),
+
+    /// A circuit or proof overflowed a frozen profile and must not select a larger one.
+    #[error("profile overflow: {table} has {actual} rows, profile allows {limit}")]
+    ProfileOverflow {
+        table: String,
+        actual: usize,
+        limit: usize,
+    },
+
+    /// Profile-closure iteration hit a structural mismatch (not a count bump).
+    #[error("profile structural mismatch: {0}")]
+    ProfileStructuralMismatch(String),
+
+    /// Profile-closure iteration did not reach a closed profile.
+    #[error("profile did not close after {iters} iterations")]
+    ProfileDidNotClose { iters: usize },
 }
 
 /// Errors for the batch STARK table prover.
@@ -1812,6 +1880,25 @@ where
 
         p3_batch_stark::verify_batch(&self.config, &airs, &proof.proof, &pvs, &effective_common)
             .map_err(|e| BatchStarkProverError::Verify(format!("{e:?}")))
+    }
+
+    /// Native verify gated on exact proof-shape equality with `shape`.
+    ///
+    /// The descriptor is checked before AIR reconstruction. A mismatched proof
+    /// is rejected; the verifier never silently adopts the proof's metadata as
+    /// a larger profile.
+    pub fn verify_all_tables_matching_shape<EF>(
+        &self,
+        proof: &BatchStarkProof<SC>,
+        shape: &crate::shape::BatchStarkShape<Val<SC>>,
+    ) -> Result<(), BatchStarkProverError>
+    where
+        EF: Field + BasedVectorSpace<Val<SC>> + ExtractBinomialW<Val<SC>>,
+        Val<SC>: Copy + PartialEq,
+        <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Proof: crate::shape::FriQueryShapeSource,
+    {
+        shape.matches_proof_with_fri(proof)?;
+        self.verify_all_tables::<EF>(proof)
     }
 }
 

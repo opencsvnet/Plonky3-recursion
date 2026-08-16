@@ -9,6 +9,7 @@ mod stark;
 
 pub use batch_stark::{
     CircuitTablesAir, PcsVerifierParams, verify_batch_circuit, verify_p3_batch_proof_circuit,
+    verify_p3_batch_shape_circuit,
 };
 pub use errors::VerificationError;
 pub use observable::ObservableCommitment;

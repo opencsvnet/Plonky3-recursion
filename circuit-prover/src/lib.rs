@@ -44,7 +44,13 @@ pub mod config;
 pub mod constraint_profile;
 pub mod field_params;
 pub mod manifest;
+pub mod shape;
 
 // Re-export main API
 pub use batch_stark_prover::*;
 pub use constraint_profile::ConstraintProfile;
+pub use shape::{
+    BatchStarkShape, FriQueryShape, FriQueryShapeSource, InstanceOpenedShape, NpoShapeEntry,
+    PreprocessedInstanceShape, PreprocessedShape, ProfileClosureError, iterate_profile_closure,
+    pad_traces_to_profile,
+};
