@@ -850,8 +850,14 @@ where
 /// Dummy prep rows are zeros, so every multiplicity is 0 and the row does not
 /// contribute to a lookup. Poseidon1/2 also mark the first dummy row as a
 /// chain boundary (second-to-last preprocessed column = 1), matching the AIR's
-/// existing power-of-two pad. Call this on the **unpadded** traces so widths
-/// can be inferred from `prep_len / have_rows`.
+/// existing power-of-two pad.
+///
+/// When a table's flattened prep is empty (the circuit never registered the
+/// op), width comes from the table spec — not from `cols.len() / have`, which
+/// is 0 and used to hard-reject. A table with no well-defined dummy prep
+/// width is [`ProofMetadataError::NoValidDummyRow`] (a finding, not a forced
+/// pad). Call this on the **unpadded** traces so a non-empty prep can still
+/// infer width from `prep_len / have_rows`.
 pub fn pad_preprocessed_to_profile<F, PF, S>(
     traces: &Traces<F>,
     primitive_columns: &mut [Vec<PF>],
@@ -890,6 +896,7 @@ where
             target,
             None,
             &format!("preprocessed primitive[{i}]"),
+            primitive_dummy_prep_width(i, profile.ext_degree),
         )?;
     }
 
@@ -920,6 +927,7 @@ where
             entry.rows,
             chain_boundary.then_some(mark_poseidon_first_dummy_chain_boundary),
             &format!("preprocessed npo {:?}", entry.op_type),
+            npo_dummy_prep_width(&entry.op_type, profile.ext_degree),
         )?;
     }
     Ok(())
@@ -985,34 +993,89 @@ fn mark_poseidon_first_dummy_chain_boundary<PF: PrimeCharacteristicRing>(row: &m
     }
 }
 
+/// Public dummy prep: `[multiplicity, witness_idx]` per logical op.
+/// Locked by `air::shape_golden::public_air_shape_is_stable` (lanes=1 → 2).
+const PUBLIC_DUMMY_PREP_WIDTH: usize = 2;
+
+/// ALU dummy prep: `AluPrepLaneCols` (13). Same all-zero row
+/// `get_airs_and_degrees_with_prep` emits for an empty ALU table. Horner
+/// extras are AIR-matrix only — the flattened per-op vec is 13 wide.
+const ALU_DUMMY_PREP_WIDTH: usize = 13;
+
+/// Known dummy-prep width for a primitive table, independent of
+/// `cols.len() / have`. Empty flattened prep (circuit never registered the
+/// op) still has an AIR-valid all-zero dummy (multiplicity 0).
+fn primitive_dummy_prep_width(table: usize, ext_degree: usize) -> Option<usize> {
+    match table {
+        i if i == PrimitiveTable::Const as usize => {
+            // [ext_mult, index, value[0..D]]. D=0 is not a real circuit.
+            (ext_degree > 0).then_some(PUBLIC_DUMMY_PREP_WIDTH + ext_degree)
+        }
+        i if i == PrimitiveTable::Public as usize => Some(PUBLIC_DUMMY_PREP_WIDTH),
+        i if i == PrimitiveTable::Alu as usize => Some(ALU_DUMMY_PREP_WIDTH),
+        _ => None,
+    }
+}
+
+/// Known dummy-prep width for a registered NPO. Poseidon width is
+/// config-specific and is inferred from a non-empty flattened vec when the
+/// circuit registered the op; an empty poseidon/unknown prep is a finding.
+fn npo_dummy_prep_width(op_type: &NpoTypeId, ext_degree: usize) -> Option<usize> {
+    match op_type.as_str() {
+        "recompose" => Some(2),
+        "recompose/coeff" if ext_degree > 0 => Some(2 + 2 * ext_degree),
+        _ => None,
+    }
+}
+
 fn pad_flat_preprocessed<PF: PrimeCharacteristicRing>(
     cols: &mut Vec<PF>,
     have: usize,
     target: usize,
     first_dummy: Option<fn(&mut [PF])>,
     table: &str,
+    known_width: Option<usize>,
 ) -> Result<(), ProofMetadataError> {
     if have == target {
         return Ok(());
     }
-    if have == 0 || !cols.len().is_multiple_of(have) {
-        return Err(ProofMetadataError::NoValidDummyRow {
-            table: table.into(),
-            actual: have,
-            limit: target,
-        });
-    }
-    let width = cols.len() / have;
-    if width == 0 {
-        return Err(ProofMetadataError::NoValidDummyRow {
-            table: table.into(),
-            actual: have,
-            limit: target,
-        });
-    }
+    let width = if have > 0 && !cols.is_empty() {
+        if !cols.len().is_multiple_of(have) {
+            return Err(ProofMetadataError::NoValidDummyRow {
+                table: table.into(),
+                actual: have,
+                limit: target,
+            });
+        }
+        let inferred = cols.len() / have;
+        if inferred == 0 {
+            known_width
+                .filter(|w| *w > 0)
+                .ok_or_else(|| ProofMetadataError::NoValidDummyRow {
+                    table: table.into(),
+                    actual: have,
+                    limit: target,
+                })?
+        } else {
+            inferred
+        }
+    } else {
+        // Empty flattened prep (or have == 0): do not infer `0 / 1 = 0`.
+        known_width
+            .filter(|w| *w > 0)
+            .ok_or_else(|| ProofMetadataError::NoValidDummyRow {
+                table: table.into(),
+                actual: have,
+                limit: target,
+            })?
+    };
     cols.resize(width * target, PF::ZERO);
     if let Some(mark) = first_dummy {
-        mark(&mut cols[have * width..(have + 1) * width]);
+        let dummy_row = have.min(target.saturating_sub(1));
+        let start = dummy_row * width;
+        if start + width <= cols.len() {
+            mark(&mut cols[start..start + width]);
+        }
     }
     Ok(())
 }

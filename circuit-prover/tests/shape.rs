@@ -626,6 +626,140 @@ fn pad_preprocessed_to_profile_marks_poseidon_chain_boundary() {
     assert!(padded[3 * width..].iter().all(|v| *v == BabyBear::ZERO));
 }
 
+/// Mint-shaped Public (and Const / Alu) empty flattened prep must synthesize
+/// the AIR-valid dummy from the table spec, not infer `width = 0 / 1 = 0`.
+#[test]
+fn pad_preprocessed_synthesizes_empty_primitive_dummy_from_spec() {
+    let (_circuit, mut traces, _data, _cfg) = baby_bear_circuit_and_traces();
+    let proof = baby_bear_base_proof();
+    let mut profile = BatchStarkShape::<BabyBear>::from_proof(&proof);
+
+    traces.public_trace.values.clear();
+    traces.public_trace.index.clear();
+    traces.const_trace.values.clear();
+    traces.const_trace.index.clear();
+    traces.alu_trace.op_kind.clear();
+    traces.alu_trace.values.clear();
+    traces.alu_trace.indices.clear();
+
+    profile.rows = RowCounts::new([8, 16, 12]);
+
+    let mut primitive: Vec<Vec<BabyBear>> = vec![Vec::new(), Vec::new(), Vec::new()];
+    let mut npo = p3_circuit::ops::NonPrimitivePreprocessedMap::default();
+    pad_preprocessed_to_profile(&traces, &mut primitive, &mut npo, &profile).unwrap();
+
+    // Const: [ext_mult, index, value[0..D]] with D=1 → width 3. All zeros.
+    assert_eq!(primitive[0].len(), 8 * 3);
+    assert!(primitive[0].iter().all(|v| *v == BabyBear::ZERO));
+    // Public: [mult, index] → width 2. All zeros (mult 0, index 0).
+    assert_eq!(primitive[1].len(), 16 * 2);
+    assert!(primitive[1].iter().all(|v| *v == BabyBear::ZERO));
+    // Alu: 13-col dummy zeros (no logup).
+    assert_eq!(primitive[2].len(), 12 * 13);
+    assert!(primitive[2].iter().all(|v| *v == BabyBear::ZERO));
+}
+
+/// Empty unknown-NPO prep stays a finding — no well-defined dummy width.
+#[test]
+fn pad_preprocessed_empty_unknown_npo_is_a_finding() {
+    let (_circuit, traces, _data, _cfg) = baby_bear_circuit_and_traces();
+    let proof = baby_bear_base_proof();
+    let mut profile = BatchStarkShape::<BabyBear>::from_proof(&proof);
+    let op = NpoTypeId::new("statement");
+    profile.non_primitives = vec![NpoShapeEntry {
+        op_type: op.clone(),
+        rows: 4,
+        lanes: 1,
+        public_values_len: 0,
+        air_variant: AirVariant::Baseline,
+    }];
+    let mut primitive: Vec<Vec<BabyBear>> = vec![Vec::new(), Vec::new(), Vec::new()];
+    let mut npo = p3_circuit::ops::NonPrimitivePreprocessedMap::default();
+    npo.insert(op, Vec::new());
+
+    let err = pad_preprocessed_to_profile(&traces, &mut primitive, &mut npo, &profile).unwrap_err();
+    assert!(
+        matches!(err, ProofMetadataError::NoValidDummyRow { .. }),
+        "unknown NPO empty prep must be a finding, not a forced pad: {err:?}"
+    );
+}
+
+/// No-public-input circuit (mint-shaped Public table): pad empty prep to a
+/// larger public profile, prove, native-verify. Dummy is multiplicity 0 +
+/// index 0, paired with the zero public trace row.
+#[test]
+fn pad_empty_public_prep_to_profile_verifies() {
+    let mut builder = CircuitBuilder::<BabyBear>::new();
+    let c = builder.define_const(BabyBear::from_u64(3));
+    let d = builder.define_const(BabyBear::from_u64(3));
+    let diff = builder.sub(c, d);
+    builder.assert_zero(diff);
+    let circuit = builder.build().unwrap();
+
+    let cfg = config::baby_bear();
+    let (airs_degrees, primitive_columns, non_primitive_columns) =
+        get_airs_and_degrees_with_prep::<BabyBearConfig, _, 1>(
+            &circuit,
+            &TablePacking::default(),
+            &[],
+            &[],
+            ConstraintProfile::Standard,
+        )
+        .unwrap();
+    assert!(
+        primitive_columns[PrimitiveTable::Public as usize].is_empty(),
+        "mint-shaped circuit must have empty Public prep"
+    );
+    let (airs, log_degrees): (Vec<_>, Vec<usize>) = airs_degrees.into_iter().unzip();
+    let prover_data = ProverData::from_airs_and_degrees(&cfg, &airs, &log_degrees);
+    let mut circuit_prover_data =
+        CircuitProverData::new(prover_data, primitive_columns, non_primitive_columns);
+    let traces = circuit.runner().run().unwrap();
+    assert!(
+        traces.public_trace.values.is_empty(),
+        "mint-shaped circuit must have empty Public trace"
+    );
+
+    let prover = BatchStarkProver::new(cfg);
+    let raw = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .unwrap();
+    prover
+        .verify_all_tables::<BabyBear>(&raw)
+        .expect("unpadded no-public proof verifies");
+
+    let mut profile = BatchStarkShape::<BabyBear>::from_proof(&raw);
+    let public_target = profile.rows[PrimitiveTable::Public].max(1) * 4;
+    profile.rows = RowCounts::new([
+        profile.rows[PrimitiveTable::Const],
+        public_target,
+        profile.rows[PrimitiveTable::Alu],
+    ]);
+
+    let mut traces = traces;
+    circuit_prover_data
+        .pad_to_profile(&mut traces, &profile)
+        .unwrap();
+    assert_eq!(traces.public_trace.values.len(), public_target);
+    assert_eq!(
+        circuit_prover_data.primitive_columns[PrimitiveTable::Public as usize].len(),
+        public_target * 2
+    );
+    assert!(
+        circuit_prover_data.primitive_columns[PrimitiveTable::Public as usize]
+            .iter()
+            .all(|v| *v == BabyBear::ZERO)
+    );
+
+    let padded = prover
+        .prove_all_tables(&traces, &circuit_prover_data)
+        .unwrap();
+    prover
+        .verify_all_tables::<BabyBear>(&padded)
+        .expect("padded empty-Public proof verifies");
+    assert_eq!(padded.rows[PrimitiveTable::Public], public_target);
+}
+
 /// Mint-shaped (few NPO rows) padded to a larger transfer-like profile:
 /// re-extracted shape matches the frozen FRI-locked profile and the padded
 /// proof verifies.
