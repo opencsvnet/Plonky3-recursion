@@ -572,6 +572,12 @@ impl<F: Copy + PartialEq> BatchStarkShape<F> {
 
     /// Componentwise-max union of two shapes that share structure.
     ///
+    /// Vector fields (`quotient_chunks`) are extended to the longer length
+    /// and then maxed per index — wholesale replacement of a longer `other`
+    /// would shrink an overlapping prefix and make the closure recurrence
+    /// non-monotone (e.g. `[10] ∪ [5, 1]` must be `[10, 1]`, not `[5, 1]`).
+    /// The result covers both inputs.
+    ///
     /// Used by [`iterate_profile_closure`] to bump a profile until it covers
     /// `shape(wrapper(profile))`.
     pub fn union(&self, other: &Self) -> Result<Self, ProofMetadataError> {
@@ -590,12 +596,13 @@ impl<F: Copy + PartialEq> BatchStarkShape<F> {
         }
         for (d, s) in out.instances.iter_mut().zip(&other.instances) {
             d.degree_bits = d.degree_bits.max(s.degree_bits);
+            // Resize, then max. Replacing when `other` is longer drops the
+            // overlapping prefix (`[10] ∪ [5, 1]` became `[5, 1]`).
             if s.quotient_chunks.len() > d.quotient_chunks.len() {
-                d.quotient_chunks = s.quotient_chunks.clone();
-            } else {
-                for (dc, sc) in d.quotient_chunks.iter_mut().zip(&s.quotient_chunks) {
-                    *dc = (*dc).max(*sc);
-                }
+                d.quotient_chunks.resize(s.quotient_chunks.len(), 0);
+            }
+            for (dc, sc) in d.quotient_chunks.iter_mut().zip(&s.quotient_chunks) {
+                *dc = (*dc).max(*sc);
             }
         }
         if let (Some(df), Some(sf)) = (out.fri.as_mut(), other.fri.as_ref()) {

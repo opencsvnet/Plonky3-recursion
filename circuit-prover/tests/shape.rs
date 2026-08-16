@@ -396,3 +396,75 @@ fn covers_rejects_fri_presence_growth() {
         other => panic!("FRI-less profile must reject, not close: {other:?}"),
     }
 }
+
+/// Sol's counterexample at 1700dd2: wholesale replace when `other` is longer
+/// turned `[10] ∪ [5, 1]` into `[5, 1]`, shrinking the established prefix.
+#[test]
+fn union_quotient_chunks_is_componentwise_max_on_mixed_length() {
+    let proof = baby_bear_base_proof();
+    let base = BatchStarkShape::<BabyBear>::from_proof(&proof);
+    assert!(!base.instances.is_empty());
+
+    let mut short_high = base.clone();
+    let mut long_low = base.clone();
+    short_high.instances[0].quotient_chunks = vec![10];
+    long_low.instances[0].quotient_chunks = vec![5, 1];
+
+    let united = short_high.union(&long_low).unwrap();
+    assert_eq!(united.instances[0].quotient_chunks, vec![10, 1]);
+    assert_eq!(united.covers(&short_high), Ok(()));
+    assert_eq!(united.covers(&long_low), Ok(()));
+
+    // Symmetric: dest already longer, overlapping prefix still maxes.
+    let united_rev = long_low.union(&short_high).unwrap();
+    assert_eq!(united_rev.instances[0].quotient_chunks, vec![10, 1]);
+    assert_eq!(united_rev.covers(&short_high), Ok(()));
+    assert_eq!(united_rev.covers(&long_low), Ok(()));
+
+    // Mixed length *and* mixed values on both sides.
+    let mut a = base.clone();
+    let mut b = base.clone();
+    a.instances[0].quotient_chunks = vec![10, 3];
+    b.instances[0].quotient_chunks = vec![8, 1, 2];
+    let mixed = a.union(&b).unwrap();
+    assert_eq!(mixed.instances[0].quotient_chunks, vec![10, 3, 2]);
+    assert_eq!(mixed.covers(&a), Ok(()));
+    assert_eq!(mixed.covers(&b), Ok(()));
+}
+
+/// Closure recurrence must be monotone: each iterate covers its predecessor.
+/// With the 1700dd2 replace, seed `[10]` ∪ wrapper `[5, 1]` closed as `[5, 1]`
+/// and the next profile no longer covered the seed.
+#[test]
+fn iterate_profile_closure_never_shrinks_profile() {
+    let proof = baby_bear_base_proof();
+    let mut seed = BatchStarkShape::<BabyBear>::from_proof(&proof);
+    seed.instances[0].quotient_chunks = vec![10];
+
+    let mut wrapper_shape = seed.clone();
+    wrapper_shape.instances[0].quotient_chunks = vec![5, 1];
+
+    let mut prev = seed.clone();
+    let mut steps = 0usize;
+    let closed = iterate_profile_closure(
+        seed.clone(),
+        |profile| {
+            steps += 1;
+            assert_eq!(
+                profile.covers(&prev),
+                Ok(()),
+                "profile shrank across closure iterations at step {steps}"
+            );
+            prev = profile.clone();
+            Ok::<_, core::convert::Infallible>(wrapper_shape.clone())
+        },
+        8,
+    )
+    .unwrap();
+
+    assert!(steps > 1, "must union-bump, not accept the seed");
+    assert_eq!(closed.instances[0].quotient_chunks, vec![10, 1]);
+    assert_eq!(closed.covers(&seed), Ok(()));
+    assert_eq!(closed.covers(&wrapper_shape), Ok(()));
+    assert_eq!(closed.covers(&prev), Ok(()));
+}
