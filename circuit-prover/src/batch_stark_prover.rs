@@ -314,9 +314,10 @@ impl<SC: StarkGenericConfig> NonPrimitiveTableEntry<SC> {
 /// [`get_airs_and_degrees_with_prep`](crate::common::get_airs_and_degrees_with_prep)
 /// and are not needed here.
 /// Cached ALU packed-Horner schedule and preprocessed trace matrix, keyed by the
-/// `(lanes, horner_packed_steps, min_height)` they were computed for.
+/// `(lanes, horner_packed_steps, min_height, alu_num_ops)` they were computed for.
 type AluScheduleCache<F> = RefCell<
     Option<(
+        usize,
         usize,
         usize,
         usize,
@@ -334,7 +335,11 @@ pub struct CircuitProverData<SC: StarkGenericConfig> {
     pub non_primitive_columns: NonPrimitivePreprocessedMap<Val<SC>>,
     /// Both are a pure function of `primitive_columns[Alu]` and the cache key (not of `D`), so
     /// they are computed once and reused across every proof for this circuit shape.
-    alu_schedule_cache: AluScheduleCache<Val<SC>>,
+    pub(crate) alu_schedule_cache: AluScheduleCache<Val<SC>>,
+    /// Set by [`Self::pad_to_profile`] so prove rebuilds `ProverData` even when
+    /// the padded logical counts stay inside the same power-of-two height
+    /// (dummy prep content still changed).
+    pub preprocessed_stale: bool,
 }
 
 impl<SC: StarkGenericConfig> CircuitProverData<SC> {
@@ -349,6 +354,7 @@ impl<SC: StarkGenericConfig> CircuitProverData<SC> {
             primitive_columns,
             non_primitive_columns,
             alu_schedule_cache: RefCell::new(None),
+            preprocessed_stale: false,
         }
     }
 
@@ -867,6 +873,14 @@ pub enum ProofMetadataError {
     /// Profile-closure iteration did not reach a closed profile.
     #[error("profile did not close after {iters} iterations")]
     ProfileDidNotClose { iters: usize },
+
+    /// An NPO table cannot be lifted to the profile because it has no AIR-valid dummy row.
+    #[error("no valid dummy row for {table}: cannot pad {actual} → {limit}")]
+    NoValidDummyRow {
+        table: String,
+        actual: usize,
+        limit: usize,
+    },
 }
 
 /// Errors for the batch STARK table prover.
@@ -1468,17 +1482,31 @@ where
         let (alu_schedule, cached_prep_trace) = {
             let mut cache = circuit_prover_data.alu_schedule_cache.borrow_mut();
             match cache.as_ref() {
-                Some((cached_lanes, cached_k, cached_min_height, schedule, prep_trace))
-                    if *cached_lanes == alu_lanes
-                        && *cached_k == horner_k
-                        && *cached_min_height == min_height =>
+                Some((
+                    cached_lanes,
+                    cached_k,
+                    cached_min_height,
+                    cached_num_ops,
+                    schedule,
+                    prep_trace,
+                )) if *cached_lanes == alu_lanes
+                    && *cached_k == horner_k
+                    && *cached_min_height == min_height
+                    && *cached_num_ops == alu_num_ops =>
                 {
                     (schedule.clone(), prep_trace.clone())
                 }
                 _ => {
                     let schedule =
                         AluAir::<Val<SC>, D>::compute_schedule_for(&alu_prep, alu_lanes, horner_k);
-                    *cache = Some((alu_lanes, horner_k, min_height, schedule.clone(), None));
+                    *cache = Some((
+                        alu_lanes,
+                        horner_k,
+                        min_height,
+                        alu_num_ops,
+                        schedule.clone(),
+                        None,
+                    ));
                     (schedule, None)
                 }
             }
@@ -1497,11 +1525,18 @@ where
         } else if let Some(prep_trace) = alu_air.preprocessed_trace() {
             alu_air = alu_air.with_precomputed_prep_trace(prep_trace.clone());
             let mut cache = circuit_prover_data.alu_schedule_cache.borrow_mut();
-            if let Some((cached_lanes, cached_k, cached_min_height, _, cached_prep_trace)) =
-                cache.as_mut()
+            if let Some((
+                cached_lanes,
+                cached_k,
+                cached_min_height,
+                cached_num_ops,
+                _,
+                cached_prep_trace,
+            )) = cache.as_mut()
                 && *cached_lanes == alu_lanes
                 && *cached_k == horner_k
                 && *cached_min_height == min_height
+                && *cached_num_ops == alu_num_ops
             {
                 *cached_prep_trace = Some(prep_trace);
             }
@@ -1674,24 +1709,38 @@ where
             non_primitive_meta.push((op_type, rows, lanes, AirVariant::Baseline));
         }
 
-        // Use the pre-computed ProverData when the AIR structure is unchanged (common case).
-        // Recompute only when lane reduction altered the lookup layout, since the number of
-        // lookups per table depends on lane count.
+        // Use the pre-computed ProverData when the AIR structure and degrees are
+        // unchanged. Recompute when:
+        // - lane reduction altered the lookup layout, or
+        // - pad-to-profile grew a table so the committed preprocessed domain
+        //   no longer matches the padded main-trace height.
         let lanes_reduced = (alu_trace_only_dummy && packing.alu_lanes() > 1)
             || (public_trace_only_dummy && packing.public_lanes() > 1);
-        let recomputed_data: Option<ProverData<SC>> = if lanes_reduced {
-            let trace_ext_degree_bits: Vec<usize> = trace_storage
-                .iter()
-                .map(|m| log2_strict_usize(m.height()) + self.config.is_zk())
-                .collect();
-            Some(ProverData::from_airs_and_degrees(
-                &self.config,
-                &air_storage,
-                &trace_ext_degree_bits,
-            ))
-        } else {
-            None
+        let trace_ext_degree_bits: Vec<usize> = trace_storage
+            .iter()
+            .map(|m| log2_strict_usize(m.height()) + self.config.is_zk())
+            .collect();
+        let degrees_grew = match &prover_data.common.preprocessed {
+            None => false,
+            Some(gp) => {
+                gp.instances.len() != trace_ext_degree_bits.len()
+                    || gp
+                        .instances
+                        .iter()
+                        .zip(&trace_ext_degree_bits)
+                        .any(|(meta, &deg)| meta.as_ref().is_some_and(|m| m.degree_bits < deg))
+            }
         };
+        let recomputed_data: Option<ProverData<SC>> =
+            if lanes_reduced || degrees_grew || circuit_prover_data.preprocessed_stale {
+                Some(ProverData::from_airs_and_degrees(
+                    &self.config,
+                    &air_storage,
+                    &trace_ext_degree_bits,
+                ))
+            } else {
+                None
+            };
         let effective_prover_data = recomputed_data.as_ref().unwrap_or(prover_data);
 
         let proof = {

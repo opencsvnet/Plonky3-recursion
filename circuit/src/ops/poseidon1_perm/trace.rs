@@ -13,7 +13,7 @@ use crate::CircuitError;
 use crate::ops::NpoTypeId;
 use crate::ops::poseidon1_perm::config::Poseidon1Config;
 use crate::ops::poseidon1_perm::state::Poseidon1ExecutionState;
-use crate::tables::NonPrimitiveTrace;
+use crate::tables::{NonPrimitiveTrace, NpoPadError};
 use crate::types::NonPrimitiveOpId;
 
 /// Poseidon1 configuration parameters for a field type.
@@ -89,7 +89,10 @@ impl<F> Poseidon1Trace<F> {
     }
 }
 
-impl<TraceF: Clone + Send + Sync + 'static, CF> NonPrimitiveTrace<CF> for Poseidon1Trace<TraceF> {
+impl<TraceF, CF> NonPrimitiveTrace<CF> for Poseidon1Trace<TraceF>
+where
+    TraceF: Clone + Send + Sync + PrimeCharacteristicRing + 'static,
+{
     fn op_type(&self) -> NpoTypeId {
         self.op_type.clone()
     }
@@ -104,6 +107,30 @@ impl<TraceF: Clone + Send + Sync + 'static, CF> NonPrimitiveTrace<CF> for Poseid
 
     fn boxed_clone(&self) -> Box<dyn NonPrimitiveTrace<CF>> {
         Box::new(self.clone())
+    }
+
+    fn pad_dummy_rows(&mut self, target: usize) -> Result<(), NpoPadError> {
+        if self.operations.len() >= target {
+            return Ok(());
+        }
+        let Some(template) = self.operations.first() else {
+            return Err(NpoPadError::NoValidDummyRow);
+        };
+        let filler = Poseidon1CircuitRow {
+            new_start: true,
+            merkle_path: false,
+            mmcs_bit: false,
+            mmcs_index_sum: TraceF::ZERO,
+            input_values: vec![TraceF::ZERO; template.input_values.len()],
+            in_ctl: vec![false; template.in_ctl.len()],
+            input_indices: vec![0; template.input_indices.len()],
+            out_ctl: vec![false; template.out_ctl.len()],
+            output_indices: vec![0; template.output_indices.len()],
+            mmcs_index_sum_idx: 0,
+            mmcs_ctl_enabled: false,
+        };
+        self.operations.resize(target, filler);
+        Ok(())
     }
 }
 

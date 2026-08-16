@@ -24,6 +24,14 @@ pub use public::{PublicTrace, PublicTraceBuilder};
 pub use runner::CircuitRunner;
 pub use witness::WitnessTrace;
 
+/// Error from [`NonPrimitiveTrace::pad_dummy_rows`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NpoPadError {
+    /// This table has no AIR-valid dummy / no-op row. Callers must surface
+    /// the gap rather than inventing a row that would not verify.
+    NoValidDummyRow,
+}
+
 /// Trait implemented by all non-primitive operation traces.
 pub trait NonPrimitiveTrace<F>: Send + Sync {
     /// Operation type for this non-primitive trace.
@@ -34,6 +42,14 @@ pub trait NonPrimitiveTrace<F>: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     /// Clone the trace into a boxed trait object.
     fn boxed_clone(&self) -> Box<dyn NonPrimitiveTrace<F>>;
+    /// Extend this trace to `target` rows with AIR-valid dummy / no-op rows.
+    ///
+    /// Default: this table has no valid dummy row. Fork-owned tables
+    /// (Poseidon1/2, recompose) override. Out-of-tree plugins keep the
+    /// default so a missing dummy is a finding, not a forced pad.
+    fn pad_dummy_rows(&mut self, _target: usize) -> Result<(), NpoPadError> {
+        Err(NpoPadError::NoValidDummyRow)
+    }
 }
 
 /// Function pointer for constructing a non-primitive trace from runner state.

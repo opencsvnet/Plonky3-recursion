@@ -24,5 +24,5 @@ pub use circuit::{Circuit, PreprocessedColumns};
 pub use errors::CircuitError;
 pub use expr::Expr;
 pub use ops::{AluOpKind, NpoPrivateData, NpoTypeId, Op, PreprocessedWriter};
-pub use tables::{CircuitRunner, Traces};
+pub use tables::{CircuitRunner, NonPrimitiveTrace, NpoPadError, Traces};
 pub use types::{ExprId, NonPrimitiveOpId, WitnessId};
