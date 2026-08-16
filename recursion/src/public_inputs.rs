@@ -1,6 +1,7 @@
 //! This module provides type-safe builders and helper functions
 //! for constructing public inputs for recursive verification circuits.
 
+use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use p3_batch_stark::{BatchProof, CommonData};
@@ -703,6 +704,30 @@ where
         let private_values = self.pack_private_values(proof);
 
         (public_values, private_values)
+    }
+
+    /// Pack values only after `shape` matches `batch_proof` exactly.
+    ///
+    /// This is the packing-side half of the D5 normalization seam: an actual
+    /// proof must equal the frozen descriptor before any values enter the
+    /// verifier circuit.
+    pub fn pack_values_matching_shape(
+        &self,
+        air_public_values: &[Vec<Val<SC>>],
+        batch_proof: &p3_circuit_prover::batch_stark_prover::BatchStarkProof<SC>,
+        common: &CommonData<SC>,
+        shape: &p3_circuit_prover::shape::BatchStarkShape<Val<SC>>,
+    ) -> Result<(Vec<SC::Challenge>, Vec<SC::Challenge>), crate::verifier::VerificationError>
+    where
+        Val<SC>: PrimeField64 + Copy + PartialEq,
+        SC::Challenge: BasedVectorSpace<Val<SC>> + From<Val<SC>>,
+        <SC::Pcs as Pcs<SC::Challenge, SC::Challenger>>::Proof:
+            p3_circuit_prover::shape::FriQueryShapeSource,
+    {
+        shape
+            .matches_proof_with_fri(batch_proof)
+            .map_err(|e| crate::verifier::VerificationError::InvalidProofShape(e.to_string()))?;
+        Ok(self.pack_values(air_public_values, &batch_proof.proof, common))
     }
 }
 
